@@ -335,28 +335,39 @@ impl K8sStore {
         expected_pod_uid: &PodUid,
     ) -> Result<SuspendExecutionClaim, SubstrateError> {
         for previous in [SandboxLifecycle::Started, SandboxLifecycle::Paused] {
-            let claimed = sqlx::query(sql!(
-                "UPDATE sandboxes s
+            // The CTE reads `command_ready_pending` from the row this statement
+            // is about to update. A `RETURNING` on the `UPDATE` itself would
+            // see the value after the lifecycle trigger has cleared it.
+            let command_ready_pending: Option<bool> = sqlx::query_scalar(sql!(
+                "WITH candidate AS (
+                     SELECT s.id, s.command_ready_pending
+                       FROM sandboxes s
+                       JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+                      WHERE s.id = $1
+                        AND s.lifecycle = $4
+                        AND e.generation = $2
+                        AND e.active
+                        AND e.pod_uid = $3
+                        AND e.state = 'running'
+                        FOR NO KEY UPDATE OF s
+                 )
+                 UPDATE sandboxes s
                     SET lifecycle = 'suspending'
-                   FROM sandbox_k8s_executions e
-                  WHERE s.id = $1
-                    AND s.lifecycle = $4
-                    AND e.sandbox_id = s.id
-                    AND e.generation = $2
-                    AND e.active
-                    AND e.pod_uid = $3
-                    AND e.state = 'running'"
+                   FROM candidate c
+                  WHERE s.id = c.id
+                 RETURNING c.command_ready_pending"
             ))
             .bind(sandbox_id.as_uuid())
             .bind(generation.get())
             .bind(expected_pod_uid.as_str())
             .bind(previous.as_str())
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await
             .db_context("failed to claim Kubernetes suspend execution")?;
-            if claimed.rows_affected() == 1 {
+            if let Some(command_ready_pending) = command_ready_pending {
                 return Ok(SuspendExecutionClaim::Claimed(SuspendClaimRestore {
                     lifecycle: previous,
+                    command_ready_pending,
                 }));
             }
         }
@@ -417,7 +428,8 @@ impl K8sStore {
     ) -> Result<bool, SubstrateError> {
         let reverted = sqlx::query(sql!(
             "UPDATE sandboxes s
-                SET lifecycle = $4
+                SET lifecycle = $4,
+                    command_ready_pending = $5
                FROM sandbox_k8s_executions e
               WHERE s.id = $1
                 AND s.lifecycle = 'suspending'
@@ -432,6 +444,7 @@ impl K8sStore {
         .bind(generation.get())
         .bind(expected_pod_uid.as_str())
         .bind(restore.lifecycle.as_str())
+        .bind(restore.command_ready_pending)
         .execute(&self.pool)
         .await
         .db_context("failed to revert Kubernetes suspend claim")?;

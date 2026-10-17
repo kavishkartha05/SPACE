@@ -15,6 +15,16 @@ use super::super::tests::{insert_test_sandbox_row, substrate_with_store_and_clie
 use super::hydration_and_suspend::{BLOCKING_DELETE_TIMEOUT, substrate_with_node_api_on};
 use super::*;
 
+/// The sandbox's `command_ready_pending` flag.
+async fn command_ready_pending(pool: &PgPool, sandbox_id: SandboxId) -> Result<bool, BoxError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT command_ready_pending FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// The node-drain marker on the sandbox, if a drain claim set one.
 async fn evacuation_marker(
     pool: &PgPool,
@@ -29,18 +39,29 @@ async fn evacuation_marker(
 }
 
 /// A suspend that fails before the node is contacted puts the sandbox back
-/// to the lifecycle the claim displaced, so a retry claims afresh instead of
-/// joining a refusal.
+/// as the claim found it, so a retry claims afresh instead of joining a
+/// refusal: the same lifecycle, and the `command_ready_pending` flag the
+/// claim's lifecycle trigger cleared.
 #[rstest::rstest]
-#[case::no_node_name_from_started("started")]
-#[case::no_node_name_from_paused("paused")]
+#[case::no_node_name_from_started("started", false)]
+#[case::no_node_name_from_paused("paused", false)]
+#[case::no_node_name_restores_a_pending_readiness_check("started", true)]
 #[tokio::test(flavor = "current_thread")]
 async fn suspend_execution_reverts_a_claim_refused_before_the_node_begins(
     #[case] previous: &str,
+    #[case] pending: bool,
 ) -> TestResult {
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let sandbox_id = SandboxId::new();
     insert_test_sandbox_row(&db.pool, sandbox_id, previous).await?;
+    if pending {
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET command_ready_pending = TRUE WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+    }
     insert_execution(
         &db.pool,
         sandbox_id,
@@ -64,6 +85,11 @@ async fn suspend_execution_reverts_a_claim_refused_before_the_node_begins(
         sandbox_lifecycle(&db.pool, sandbox_id).await?,
         previous,
         "{previous}: the claim must be reverted"
+    );
+    assert_eq!(
+        command_ready_pending(&db.pool, sandbox_id).await?,
+        pending,
+        "{previous}: the readiness flag must come back as the claim found it"
     );
     assert_eq!(evacuation_marker(&db.pool, sandbox_id).await?, None);
     assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
@@ -206,6 +232,69 @@ async fn a_node_drain_claim_is_joined_and_never_reverted_by_a_refused_suspend() 
         Some("started")
     );
     assert!(log.lock().unwrap().is_empty(), "no pod may be retired");
+    Ok(())
+}
+
+/// The claim locks the sandbox row before it decides, so a writer that holds
+/// the row and moves the lifecycle makes the claim lose instead of being
+/// overwritten with `suspending`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_suspend_claim_waits_for_a_concurrent_lifecycle_change_and_loses() -> TestResult {
+    // One connection for the holder, one for the claim and one to watch it.
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed::running("space-sbx-claim-lock-g1", "claim-lock-uid"),
+    )
+    .await?;
+    let (client, _log) =
+        scripted_kube_client(|_| kube_status(StatusCode::BAD_REQUEST, "BadRequest"));
+    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let mut holder = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'stopping' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut *holder)
+    .await?;
+
+    let pod_uid = PodUid::parse("claim-lock-uid")?;
+    let claim =
+        substrate
+            .store
+            .claim_suspend_execution(sandbox_id, ExecutionGeneration::new(1)?, &pod_uid);
+    let release = async {
+        // Commit only once the claim is queued behind the holder's row lock.
+        loop {
+            let waiting: i64 = sqlx::query_scalar(sql!(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'"
+            ))
+            .fetch_one(&db.pool)
+            .await?;
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        holder.commit().await?;
+        Ok::<(), BoxError>(())
+    };
+    let (claimed, released) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(claim, release)
+    })
+    .await
+    .map_err(|_| "the claim never queued behind the lifecycle change")?;
+    released?;
+
+    assert!(
+        matches!(claimed, Err(SubstrateError::Unavailable { .. })),
+        "the claim must lose to the concurrent change, got {claimed:?}"
+    );
+    assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopping");
     Ok(())
 }
 

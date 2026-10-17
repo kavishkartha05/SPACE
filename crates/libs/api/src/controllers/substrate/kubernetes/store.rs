@@ -110,11 +110,14 @@ struct CommittedSuspendArtifactRow {
 }
 
 /// What a fresh suspend claim displaced, so a failure before the node is
-/// asked to suspend can put the sandbox back.
+/// asked to suspend can put the sandbox back exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SuspendClaimRestore {
     /// The lifecycle the claim moved the sandbox out of.
     pub(super) lifecycle: SandboxLifecycle,
+    /// `command_ready_pending` as the claim found it. Leaving `started`
+    /// clears it, and nothing sets it again on the way back.
+    pub(super) command_ready_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

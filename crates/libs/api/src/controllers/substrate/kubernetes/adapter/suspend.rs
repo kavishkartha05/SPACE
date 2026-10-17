@@ -48,6 +48,16 @@ pub(super) enum GenerationSuspendOutcome {
     NodeDeleted,
 }
 
+/// A failed generation suspend, and whether the node provably never began it.
+#[derive(Debug)]
+pub(super) struct GenerationSuspendFailure {
+    pub(super) error: SubstrateError,
+    /// True only for a refusal the node's handler returns before it records
+    /// the suspend, and only when no earlier call in this poll could have
+    /// reached it. Every other failure may have happened after the node began.
+    pub(super) node_not_begun: bool,
+}
+
 pub(super) async fn await_generation_suspend(
     client: &mut RuntimeClient,
     sandbox_id: SandboxId,
@@ -55,7 +65,7 @@ pub(super) async fn await_generation_suspend(
     endpoint_addr: &str,
     deadline: Instant,
     durability_budget: Duration,
-) -> Result<GenerationSuspendOutcome, SubstrateError> {
+) -> Result<GenerationSuspendOutcome, GenerationSuspendFailure> {
     poll_generation_suspend(
         |request| {
             let mut client = client.clone();
@@ -78,7 +88,7 @@ pub(super) async fn poll_generation_suspend<F, Fut>(
     deadline: Instant,
     // The budget `deadline` was derived from, named in the timeout error.
     durability_budget: Duration,
-) -> Result<GenerationSuspendOutcome, SubstrateError>
+) -> Result<GenerationSuspendOutcome, GenerationSuspendFailure>
 where
     F: FnMut(
         tonic::Request<pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendRequest>,
@@ -101,6 +111,7 @@ where
     let mut pending_reason_logs = 0_u8;
     let mut last_logged_pending_reason = None;
     let mut next_pending_reason_log_at = poll_started_at;
+    let mut refused_before_begin = false;
     let result = async {
         loop {
             let mut request = tonic::Request::new(
@@ -144,6 +155,13 @@ where
                     continue;
                 }
                 Err(error) => {
+                    // Each call in this poll that could have reached the node
+                    // is counted above, so with none counted this is the first
+                    // reply. The node-api forwards the call once, replaying it
+                    // only after a failure that never reached the handler.
+                    refused_before_begin = pending_responses == 0
+                        && retryable_errors == 0
+                        && generation_suspend_rpc_refused_before_begin(&error);
                     return Err(SubstrateError::Unavailable {
                         message: format!(
                             "node-api generation-bound suspend at {endpoint_addr} failed: {error}"
@@ -242,7 +260,23 @@ where
             "generation-bound suspend polling failed"
         );
     }
-    result
+    result.map_err(|error| GenerationSuspendFailure {
+        error,
+        node_not_begun: refused_before_begin,
+    })
+}
+
+/// Statuses the node's `PrepareTeardownSuspend` handler returns only before
+/// it records the suspend: request validation and peer authorization. The
+/// handler's later failures (`Internal`, `NotFound`, `FailedPrecondition`)
+/// can follow a suspend that already began, so they are not listed.
+pub(in crate::controllers::substrate::kubernetes) fn generation_suspend_rpc_refused_before_begin(
+    error: &tonic::Status,
+) -> bool {
+    matches!(
+        error.code(),
+        tonic::Code::InvalidArgument | tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+    )
 }
 
 pub(in crate::controllers::substrate::kubernetes) fn generation_suspend_rpc_should_retry(
@@ -510,7 +544,10 @@ impl KubernetesSubstrate {
                             "sandbox {sandbox_id} was deleted on its node before suspend completed"
                         ),
                     }),
-                Err(error) => Err(error),
+                Err(failure) => {
+                    *node_may_have_begun = !failure.node_not_begun;
+                    Err(failure.error)
+                }
             };
             let published_artifact = match published_artifact {
                 Ok(published_artifact) => published_artifact,

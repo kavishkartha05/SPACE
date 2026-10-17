@@ -2,6 +2,8 @@
 //! the claim's revert, what it restores, what it leaves to other writers, and
 //! the failures that keep the claim.
 
+use std::sync::Arc;
+
 use axum::http::{Method, StatusCode};
 use pplx_space_common_core::types::{ExecutionGeneration, LocalArtifactId, PodUid};
 use pplx_space_sbx_mgr_client::proto as sbx;
@@ -38,19 +40,45 @@ async fn evacuation_marker(
     .await?)
 }
 
-/// A suspend that fails before the node is contacted puts the sandbox back
+fn pending_suspend_reply() -> ScriptedReply {
+    ScriptedReply::message(&sbx::PrepareTeardownSuspendResponse {
+        outcome: sbx::TeardownSuspendOutcome::Pending as i32,
+        reason: None,
+        published_artifact: None,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RefusedBeforeNode {
+    /// The active execution has no `k8s_node_name`, so no node is asked.
+    NoNodeName,
+    /// The node's first answer is a peer-authorization refusal, which its
+    /// handler returns before it records any suspend.
+    NodeDeniesTheFirstCall,
+}
+
+/// A suspend that fails before the node can have begun puts the sandbox back
 /// as the claim found it, so a retry claims afresh instead of joining a
 /// refusal: the same lifecycle, and the `command_ready_pending` flag the
 /// claim's lifecycle trigger cleared.
 #[rstest::rstest]
-#[case::no_node_name_from_started("started", false)]
-#[case::no_node_name_from_paused("paused", false)]
-#[case::no_node_name_restores_a_pending_readiness_check("started", true)]
+#[case::no_node_name_from_started(RefusedBeforeNode::NoNodeName, "started", false)]
+#[case::no_node_name_from_paused(RefusedBeforeNode::NoNodeName, "paused", false)]
+#[case::no_node_name_restores_a_pending_readiness_check(
+    RefusedBeforeNode::NoNodeName,
+    "started",
+    true
+)]
+#[case::node_denies_the_first_call(RefusedBeforeNode::NodeDeniesTheFirstCall, "started", false)]
 #[tokio::test(flavor = "current_thread")]
 async fn suspend_execution_reverts_a_claim_refused_before_the_node_begins(
+    #[case] refusal: RefusedBeforeNode,
     #[case] previous: &str,
     #[case] pending: bool,
 ) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
     let sandbox_id = SandboxId::new();
     insert_test_sandbox_row(&db.pool, sandbox_id, previous).await?;
@@ -62,34 +90,55 @@ async fn suspend_execution_reverts_a_claim_refused_before_the_node_begins(
         .execute(&db.pool)
         .await?;
     }
-    insert_execution(
-        &db.pool,
-        sandbox_id,
-        ExecutionSeed {
+    let seed = ExecutionSeed::running("space-sbx-reverted-claim-g1", "reverted-claim-uid");
+    let seed = match refusal {
+        RefusedBeforeNode::NoNodeName => ExecutionSeed {
             k8s_node_name: None,
-            ..ExecutionSeed::running("space-sbx-reverted-claim-g1", "reverted-claim-uid")
+            ..seed
         },
-    )
-    .await?;
+        RefusedBeforeNode::NodeDeniesTheFirstCall => seed,
+    };
+    insert_execution(&db.pool, sandbox_id, seed).await?;
     let (client, log) =
         scripted_kube_client(|_| kube_status(StatusCode::BAD_REQUEST, "BadRequest"));
-    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let worker = match refusal {
+        RefusedBeforeNode::NoNodeName => None,
+        RefusedBeforeNode::NodeDeniesTheFirstCall => Some(
+            start_scripted_worker(ScriptedWorkerConfig::new([(
+                "WorkerApi/PrepareTeardownSuspend",
+                ScriptedReply::Status(tonic::Status::permission_denied("peer not allowed")),
+            )]))
+            .await?,
+        ),
+    };
+    let substrate = match &worker {
+        Some(worker) => substrate_with_node_api_on(&db.pool, client, worker.port),
+        None => substrate_with_store_and_client(db.pool.clone(), client),
+    };
 
     let outcome = substrate.suspend_execution_tracked(sandbox_id).await;
 
     assert!(
         matches!(outcome, Err(SubstrateError::Unavailable { .. })),
-        "{previous}: expected a retryable refusal, got {outcome:?}"
+        "{refusal:?}: expected a retryable refusal, got {outcome:?}"
     );
+    if let Some(worker) = &worker {
+        assert!(
+            !worker
+                .received("WorkerApi/PrepareTeardownSuspend")
+                .is_empty(),
+            "{refusal:?}: the refusal must come from the node"
+        );
+    }
     assert_eq!(
         sandbox_lifecycle(&db.pool, sandbox_id).await?,
         previous,
-        "{previous}: the claim must be reverted"
+        "{refusal:?}: the claim must be reverted"
     );
     assert_eq!(
         command_ready_pending(&db.pool, sandbox_id).await?,
         pending,
-        "{previous}: the readiness flag must come back as the claim found it"
+        "{refusal:?}: the readiness flag must come back as the claim found it"
     );
     assert_eq!(evacuation_marker(&db.pool, sandbox_id).await?, None);
     assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
@@ -98,7 +147,7 @@ async fn suspend_execution_reverts_a_claim_refused_before_the_node_begins(
 }
 
 /// After a refused claim is reverted, a retry claims the sandbox afresh rather
-/// than joining the refusal, and completes once the node can be reached.
+/// than joining the refusal, and completes once the node accepts.
 #[tokio::test(flavor = "current_thread")]
 async fn a_suspend_retried_after_a_reverted_claim_completes() -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
@@ -112,24 +161,24 @@ async fn a_suspend_retried_after_a_reverted_claim_completes() -> TestResult {
     insert_execution(
         &db.pool,
         sandbox_id,
-        ExecutionSeed {
-            k8s_node_name: None,
-            ..ExecutionSeed::running(pod_name, "retried-claim-uid")
-        },
+        ExecutionSeed::running(pod_name, "retried-claim-uid"),
     )
     .await?;
     let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
         "WorkerApi/PrepareTeardownSuspend",
-        ScriptedReply::message(&sbx::PrepareTeardownSuspendResponse {
-            outcome: sbx::TeardownSuspendOutcome::Durable as i32,
-            reason: None,
-            published_artifact: Some(sbx::PublishedArtifact {
-                local_artifact_id: node_artifact.to_string(),
-                artifact_kind: sbx::ArtifactKind::Full as i32,
-                origin: sbx::ArtifactOrigin::Suspend as i32,
-                snapshot_name: None,
+        ScriptedReply::Sequence(Arc::from([
+            ScriptedReply::Status(tonic::Status::permission_denied("peer not allowed")),
+            ScriptedReply::message(&sbx::PrepareTeardownSuspendResponse {
+                outcome: sbx::TeardownSuspendOutcome::Durable as i32,
+                reason: None,
+                published_artifact: Some(sbx::PublishedArtifact {
+                    local_artifact_id: node_artifact.to_string(),
+                    artifact_kind: sbx::ArtifactKind::Full as i32,
+                    origin: sbx::ArtifactOrigin::Suspend as i32,
+                    snapshot_name: None,
+                }),
             }),
-        }),
+        ])),
     )]))
     .await?;
     let (client, log) = scripted_kube_client(move |request| {
@@ -151,21 +200,7 @@ async fn a_suspend_retried_after_a_reverted_claim_completes() -> TestResult {
         "expected a retryable refusal, got {refused:?}"
     );
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "started");
-    assert!(
-        worker
-            .received("WorkerApi/PrepareTeardownSuspend")
-            .is_empty(),
-        "the refused suspend must not reach the node"
-    );
 
-    sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions SET k8s_node_name = $2
-          WHERE sandbox_id = $1 AND active"
-    ))
-    .bind(sandbox_id)
-    .bind(WORKER_NODE)
-    .execute(&db.pool)
-    .await?;
     let returned = substrate
         .suspend_execution_tracked(sandbox_id)
         .await?
@@ -178,6 +213,76 @@ async fn a_suspend_retried_after_a_reverted_claim_completes() -> TestResult {
         !requests_matching(&log, &Method::DELETE).is_empty(),
         "the retry must retire the pod"
     );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NodeMayHaveBegun {
+    /// A transport failure the poll retried, which may have reached the node,
+    /// then a refusal that alone would be safe to revert.
+    RetriedFailureThenDenied,
+    /// The node answered Pending, so it recorded the suspend, then refused.
+    PendingThenDenied,
+}
+
+/// A refusal is reverted only when it is the node's first reply. After an
+/// earlier call that may have reached the node, the claim stays for a retry
+/// to join.
+#[rstest::rstest]
+#[case::retried_failure_then_denied(NodeMayHaveBegun::RetriedFailureThenDenied)]
+#[case::pending_then_denied(NodeMayHaveBegun::PendingThenDenied)]
+#[tokio::test(flavor = "current_thread")]
+async fn suspend_execution_keeps_a_claim_the_node_may_have_begun(
+    #[case] earlier: NodeMayHaveBegun,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed::running("space-sbx-begun-claim-g1", "begun-claim-uid"),
+    )
+    .await?;
+    let first = match earlier {
+        NodeMayHaveBegun::RetriedFailureThenDenied => {
+            ScriptedReply::Status(tonic::Status::unavailable("node restarting"))
+        }
+        NodeMayHaveBegun::PendingThenDenied => pending_suspend_reply(),
+    };
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
+        "WorkerApi/PrepareTeardownSuspend",
+        ScriptedReply::Sequence(Arc::from([
+            first,
+            ScriptedReply::Status(tonic::Status::permission_denied("peer not allowed")),
+        ])),
+    )]))
+    .await?;
+    let (client, log) =
+        scripted_kube_client(|_| kube_status(StatusCode::BAD_REQUEST, "BadRequest"));
+    let substrate = substrate_with_node_api_on(&db.pool, client, worker.port);
+
+    let outcome = substrate.suspend_execution_tracked(sandbox_id).await;
+
+    assert!(
+        matches!(outcome, Err(SubstrateError::Unavailable { .. })),
+        "{earlier:?}: expected a retryable refusal, got {outcome:?}"
+    );
+    assert_eq!(
+        worker.received("WorkerApi/PrepareTeardownSuspend").len(),
+        2,
+        "{earlier:?}: the refusal must be the second call"
+    );
+    assert_eq!(
+        sandbox_lifecycle(&db.pool, sandbox_id).await?,
+        "suspending",
+        "{earlier:?}: the claim must be kept"
+    );
+    assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+    assert!(log.lock().unwrap().is_empty(), "no pod may be retired");
     Ok(())
 }
 

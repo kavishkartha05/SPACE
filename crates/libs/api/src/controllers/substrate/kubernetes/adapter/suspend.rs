@@ -307,6 +307,12 @@ pub(in crate::controllers::substrate::kubernetes) fn suspend_pod_deletion_confir
 
 impl KubernetesSubstrate {
     /// Everything `suspend_execution` does once it holds the suspend claim.
+    ///
+    /// A claim this call just made is undone when the suspend fails before
+    /// the node was asked to begin: nothing node-side exists to finish, and
+    /// leaving the sandbox `suspending` would make every retry join the same
+    /// refusal. A failure after the node may have begun leaves the claim for
+    /// a retry to join or the transient-lifecycle sweeper to settle.
     pub(in crate::controllers::substrate::kubernetes) async fn suspend_claimed_execution(
         &self,
         sandbox_id: SandboxId,
@@ -316,9 +322,62 @@ impl KubernetesSubstrate {
         suspend_claim: SuspendExecutionClaim,
         suspend_deadline: Instant,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
+        let pod_uid = expected_pod_uid.clone();
+        let mut node_may_have_begun = false;
+        let outcome = self
+            .contact_node_and_finish_suspend(
+                sandbox_id,
+                execution,
+                expected_generation,
+                expected_pod_uid,
+                suspend_claim,
+                suspend_deadline,
+                &mut node_may_have_begun,
+            )
+            .await;
+        if outcome.is_err()
+            && !node_may_have_begun
+            && let SuspendExecutionClaim::Claimed(restore) = suspend_claim
+        {
+            match self
+                .store
+                .revert_suspend_claim(sandbox_id, expected_generation, &pod_uid, restore)
+                .await
+            {
+                Ok(reverted) => tracing::info!(
+                    %sandbox_id,
+                    generation = %expected_generation,
+                    reverted,
+                    "reverted the Kubernetes suspend claim after a refusal before the node began"
+                ),
+                Err(error) => tracing::warn!(
+                    %sandbox_id,
+                    generation = %expected_generation,
+                    %error,
+                    "failed to revert the Kubernetes suspend claim after a refusal before the node began"
+                ),
+            }
+        }
+        outcome
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the suspend steps share one claimed execution and the begun flag"
+    )]
+    async fn contact_node_and_finish_suspend(
+        &self,
+        sandbox_id: SandboxId,
+        execution: ActiveExecutionStatusRow,
+        expected_generation: ExecutionGeneration,
+        expected_pod_uid: PodUid,
+        suspend_claim: SuspendExecutionClaim,
+        suspend_deadline: Instant,
+        node_may_have_begun: &mut bool,
+    ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
         let committed_suspend_artifact = match suspend_claim {
             SuspendExecutionClaim::Completed(artifact) => Some(artifact),
-            SuspendExecutionClaim::Claimed | SuspendExecutionClaim::Existing => {
+            SuspendExecutionClaim::Claimed(_) | SuspendExecutionClaim::Existing => {
                 self.store
                     .committed_suspend_artifact(sandbox_id, expected_generation, &expected_pod_uid)
                     .await?
@@ -421,6 +480,7 @@ impl KubernetesSubstrate {
             };
 
             let suspend_rpc_started_at = Instant::now();
+            *node_may_have_begun = true;
             let published_artifact = match await_generation_suspend(
                 &mut client,
                 sandbox_id,

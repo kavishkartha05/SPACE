@@ -109,9 +109,17 @@ struct CommittedSuspendArtifactRow {
     artifact_origin: Option<ArtifactOrigin>,
 }
 
+/// What a fresh suspend claim displaced, so a failure before the node is
+/// asked to suspend can put the sandbox back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SuspendClaimRestore {
+    /// The lifecycle the claim moved the sandbox out of.
+    pub(super) lifecycle: SandboxLifecycle,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SuspendExecutionClaim {
-    Claimed,
+    Claimed(SuspendClaimRestore),
     Existing,
     Completed(PublishedLocalArtifact),
 }
@@ -119,7 +127,7 @@ pub(super) enum SuspendExecutionClaim {
 impl SuspendExecutionClaim {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
-            Self::Claimed => "claimed",
+            Self::Claimed(_) => "claimed",
             Self::Existing => "existing",
             Self::Completed(_) => "completed",
         }

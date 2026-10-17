@@ -355,7 +355,9 @@ impl K8sStore {
             .await
             .db_context("failed to claim Kubernetes suspend execution")?;
             if claimed.rows_affected() == 1 {
-                return Ok(SuspendExecutionClaim::Claimed);
+                return Ok(SuspendExecutionClaim::Claimed(SuspendClaimRestore {
+                    lifecycle: previous,
+                }));
             }
         }
 
@@ -395,6 +397,45 @@ impl K8sStore {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Put a sandbox back to the lifecycle a fresh suspend claim displaced,
+    /// for a suspend that failed before the node was asked to begin.
+    ///
+    /// Returns whether this call reverted the claim. The statement is a
+    /// compare-and-swap on the claim itself: the row must still be
+    /// `suspending` with no evacuation marker (a node-drain claim carries
+    /// one, and the drain reverts its own), and the claimed execution must
+    /// still be the active, unsuspended one. Anything else means another
+    /// writer owns the row now, and this leaves it alone.
+    pub(in crate::controllers::substrate::kubernetes) async fn revert_suspend_claim(
+        &self,
+        sandbox_id: SandboxId,
+        generation: ExecutionGeneration,
+        expected_pod_uid: &PodUid,
+        restore: SuspendClaimRestore,
+    ) -> Result<bool, SubstrateError> {
+        let reverted = sqlx::query(sql!(
+            "UPDATE sandboxes s
+                SET lifecycle = $4
+               FROM sandbox_k8s_executions e
+              WHERE s.id = $1
+                AND s.lifecycle = 'suspending'
+                AND s.evacuation_restore_target IS NULL
+                AND e.sandbox_id = s.id
+                AND e.generation = $2
+                AND e.active
+                AND e.pod_uid = $3
+                AND e.state = 'running'"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(generation.get())
+        .bind(expected_pod_uid.as_str())
+        .bind(restore.lifecycle.as_str())
+        .execute(&self.pool)
+        .await
+        .db_context("failed to revert Kubernetes suspend claim")?;
+        Ok(reverted.rows_affected() == 1)
     }
 
     /// Match the node's exact suspend observation to an unfinished backup.

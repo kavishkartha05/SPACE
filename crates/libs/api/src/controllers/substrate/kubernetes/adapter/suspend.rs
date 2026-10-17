@@ -418,6 +418,9 @@ impl KubernetesSubstrate {
             }
         };
         let node_suspend_artifact = if committed_suspend_artifact.is_some() {
+            // A committed artifact means a suspend already reached the node, so
+            // a failure while retiring the pod must keep the claim.
+            *node_may_have_begun = true;
             tracing::info!(
                 sandbox_id = %sandbox_id,
                 generation = %expected_generation,
